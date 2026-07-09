@@ -33,9 +33,21 @@ const ZSProvider = (() => {
     userText: ".whitespace-pre-wrap",
     // Assistant text: sometimes inside <p> or .prose
     assistantText: "p, .prose, .markdown",
-    // Composer
-    editor: "textarea[placeholder*='Ask me anything']",
-    sendBtn: "button[data-track-id='home_send_btn']",
+    // Composer - multiple fallback selectors for different MiMo versions
+    editor: [
+      "textarea[placeholder*='Ask me anything']",
+      "textarea[placeholder*='Ask']",
+      "textarea[placeholder*='Message']",
+      "textarea[placeholder*='message']",
+      "textarea:not([aria-hidden='true'])"
+    ].join(","),
+    sendBtn: [
+      "button[data-track-id='home_send_btn']",
+      "button[aria-label*='send' i]",
+      "button[aria-label*='Send']",
+      "button[type='submit']:not([disabled])",
+      "button:has(svg):not([disabled])"
+    ].join(","),
     stopBtn: "button[aria-label*='stop' i], button[class*='stop']",
     generating: ".loading, .streaming, [class*='generating']",
     errorSurfaces: '[role="alert"], [class*="error"], [class*="alert"], [class*="toast"]',
@@ -113,11 +125,8 @@ const ZSProvider = (() => {
   // Text used by the core to CLASSIFY a turn for camouflage - excludes the
   // reasoning area AND any element matching `excludeSel`.
   function classifyText(item, excludeSel) {
-    // For simplicity, we return the same as itemText, but we could exclude
-    // elements with excludeSel if needed.
     let text = itemText(item);
     if (excludeSel) {
-      // Remove any content inside elements matching excludeSel
       const temp = item.cloneNode(true);
       const els = temp.querySelectorAll(excludeSel);
       for (const el of els) el.remove();
@@ -134,27 +143,58 @@ const ZSProvider = (() => {
   // Get the main textarea (composer). Scope to the site's composer only;
   // avoid matching ZeroScript's own injected UI.
   function getEditor() {
+    // Try the composite selector first
     const editors = document.querySelectorAll(S.editor);
     for (const e of editors) {
       if (e.closest('#zs-root')) continue;
       if (e.offsetParent === null && e.closest('[style*="display:none"]')) continue;
       return e;
     }
+    // Broader fallback: any visible textarea not in our UI
+    const allTextareas = document.querySelectorAll('textarea');
+    for (const ta of allTextareas) {
+      if (ta.closest('#zs-root')) continue;
+      if (ta.offsetParent === null) continue;
+      if (ta.getAttribute('aria-hidden') === 'true') continue;
+      return ta;
+    }
     return null;
   }
 
   // Get the primary send button
   function getSendBtn() {
+    // Try the composite selector first
     const btns = document.querySelectorAll(S.sendBtn);
     for (const b of btns) {
       if (b.closest('#zs-root')) continue;
       if (b.offsetParent !== null && !b.disabled) return b;
     }
-    // Fallback: any button inside the composer with type submit
-    const composer = document.querySelector('[class*="composer"], [class*="input-area"]');
-    if (composer) {
-      const btn = composer.querySelector('button[type="submit"], button:not([disabled])');
-      if (btn) return btn;
+    // Broader fallback: find a button near the textarea
+    const editor = getEditor();
+    if (editor) {
+      // Look for a sibling or nearby button
+      const parent = editor.closest('form') || editor.parentElement;
+      if (parent) {
+        const btn = parent.querySelector('button[type="submit"]:not([disabled]), button:not([disabled])');
+        if (btn && !btn.closest('#zs-root')) return btn;
+      }
+      // Look in the same container
+      let container = editor.closest('[class*="input"], [class*="composer"], [class*="footer"], [class*="bottom"]');
+      if (!container) container = editor.parentElement?.parentElement;
+      if (container) {
+        const btn = container.querySelector('button:not([disabled])');
+        if (btn && !btn.closest('#zs-root')) return btn;
+      }
+    }
+    // Last resort: any visible, non-disabled button that looks like a send button
+    const allBtns = document.querySelectorAll('button:not([disabled])');
+    for (const b of allBtns) {
+      if (b.closest('#zs-root')) continue;
+      if (b.offsetParent === null) continue;
+      const svg = b.querySelector('svg');
+      if (svg && b.offsetWidth < 100 && b.offsetHeight < 60) {
+        return b;
+      }
     }
     return null;
   }
@@ -180,238 +220,41 @@ const ZSProvider = (() => {
   function isGenerating() {
     if (document.querySelector(S.generating)) return true;
     const btn = getSendBtn();
-    if (btn && isStopBtn(btn)) return true;
-    if (document.querySelector('[class*="spinner"], [class*="thinking"]')) return true;
+    if (isStopBtn(btn)) return true;
     return false;
   }
 
-  // Check for a "Continue" button that needs to be clicked to resume.
-  function getContinueBtn() {
-    const btns = document.querySelectorAll('button, [role="button"]');
-    for (const b of btns) {
-      if (b.closest('#zs-root')) continue;
-      const txt = b.textContent.trim();
-      if (RE.continueBtn.test(txt)) return b;
-    }
-    return null;
-  }
-
-  // ── Provider interface ──────────────────────────────────────────────────
-
-  // init: called by core with a diagnostic function.
-  function init(diagFn) {
-    diag = diagFn || (() => {});
-  }
-
-  // isActive: returns true if this provider matches the current page.
-  function isActive() {
-    const url = window.location.href;
-    return url.includes('aistudio.xiaomimimo.com') || url.includes('ultraspeed.xiaomimimo.com');
-  }
-
-  // isFreshChat: returns true if this is a new/empty conversation (no messages).
-  function isFreshChat() {
-    const items = allItems();
-    return items.length === 0;
-  }
-
-  // snapshot: returns a snapshot of the current conversation state for the core.
+  // Snapshot for diagnostics
   function snapshot() {
-    const items = allItems();
-    const users = items.filter(isUserItem);
-    const assistants = items.filter(isAssistantItem);
     return {
-      total: items.length,
-      userCount: users.length,
-      assistantCount: assistants.length,
-      lastUserText: users.length > 0 ? itemText(users[users.length - 1]) : null,
-      lastAssistantText: assistants.length > 0 ? itemText(assistants[assistants.length - 1]) : null,
-      isFresh: items.length === 0,
+      userCount: userCount(),
+      assistantCount: assistantCount(),
+      generating: isGenerating(),
+      editorFound: !!getEditor(),
+      sendBtnFound: !!getSendBtn(),
     };
   }
 
-  // typeAndSend: type the given text into the composer and send it.
-  async function typeAndSend(text) {
-    const editor = getEditor();
-    if (!editor) {
-      diag('[MiMo] No editor found');
-      return false;
-    }
-
-    editor.focus();
-    editor.value = text;
-    editor.dispatchEvent(new Event('input', { bubbles: true }));
-
-    await sleep(100);
-
-    const sendBtn = getSendBtn();
-    if (sendBtn) {
-      sendBtn.click();
-      return true;
-    }
-
-    // Fallback: try pressing Enter
-    editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-    return true;
+  // Initialize - receive the diag function from core
+  function init(opts) {
+    if (opts && opts.diag) diag = opts.diag;
   }
 
-  // getLastAssistantMessage: returns the text of the latest assistant turn.
-  function getLastAssistantMessage() {
-    const items = assistantItems();
-    if (items.length === 0) return null;
-    const last = items[items.length - 1];
-    return itemText(last);
-  }
-
-  // getLastAssistantNode: returns the DOM node of the latest assistant turn.
-  function getLastAssistantNode() {
-    const items = assistantItems();
-    if (items.length === 0) return null;
-    return items[items.length - 1];
-  }
-
-  // getLastUserMessage: returns the text of the latest user turn.
-  function getLastUserMessage() {
-    const items = allItems().filter(isUserItem);
-    if (items.length === 0) return null;
-    const last = items[items.length - 1];
-    return itemText(last);
-  }
-
-  // getLastUserNode: returns the DOM node of the latest user turn.
-  function getLastUserNode() {
-    const items = allItems().filter(isUserItem);
-    if (items.length === 0) return null;
-    return items[items.length - 1];
-  }
-
-  // getTurnCounts: returns { user, assistant } counts.
-  function getTurnCounts() {
-    return { user: userCount(), assistant: assistantCount() };
-  }
-
-  // waitForResponse: waits for the model to finish generating.
-  // Returns the final assistant message text, or null on timeout/error.
-  async function waitForResponse(timeoutMs) {
-    const start = Date.now();
-    const timeout = timeoutMs || timings.RESPONSE_TIMEOUT_MS;
-
-    let lastText = '';
-    let stableStart = 0;
-    let idleStart = 0;
-
-    while (Date.now() - start < timeout) {
-      if (checkForErrors()) {
-        diag('[MiMo] Error detected, stopping wait');
-        return null;
-      }
-
-      const items = assistantItems();
-      if (items.length === 0) {
-        await sleep(200);
-        continue;
-      }
-
-      const latest = items[items.length - 1];
-      const text = itemText(latest);
-
-      if (!text.trim()) {
-        await sleep(200);
-        continue;
-      }
-
-      const contBtn = getContinueBtn();
-      if (contBtn) {
-        diag('[MiMo] Continue button detected, clicking it');
-        contBtn.click();
-        await sleep(500);
-        continue;
-      }
-
-      const gen = isGenerating();
-      if (gen) {
-        idleStart = 0;
-        if (text !== lastText) {
-          stableStart = 0;
-          lastText = text;
-        } else {
-          if (stableStart === 0) stableStart = Date.now();
-          if (Date.now() - stableStart > timings.STABLE_MS) {
-            diag('[MiMo] Text frozen while generating, assuming done');
-            return lastText;
-          }
-        }
-      } else {
-        if (lastText && text === lastText) {
-          if (idleStart === 0) idleStart = Date.now();
-          if (Date.now() - idleStart > timings.GEN_IDLE_MS) {
-            diag('[MiMo] Text stable, response complete');
-            return lastText;
-          }
-        } else {
-          idleStart = 0;
-          lastText = text;
-        }
-      }
-
-      if (lastText.trim() && Date.now() - start > 30000) {
-        diag('[MiMo] Long wait with text, returning what we have');
-        return lastText;
-      }
-
-      await sleep(500);
-    }
-
-    const finalText = getLastAssistantMessage();
-    if (finalText) {
-      diag('[MiMo] Timeout but returning last message');
-      return finalText;
-    }
-    diag('[MiMo] Timeout with no response');
-    return null;
-  }
-
-  // checkForErrors: scans for error messages and returns true if found.
-  function checkForErrors() {
-    const surfaces = document.querySelectorAll(S.errorSurfaces);
-    for (const el of surfaces) {
-      const txt = el.textContent || '';
-      if (RE.contextLimit.test(txt) || RE.tooLong.test(txt) || RE.busy.test(txt)) {
-        diag('[MiMo] Error detected:', txt);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // getSiteName: returns a human-readable name for the current site.
-  function getSiteName() {
-    const url = window.location.href;
-    if (url.includes('ultraspeed')) return 'MiMo (UltraSpeed)';
-    return 'MiMo Studio';
-  }
-
-  // ── Exports ─────────────────────────────────────────────────────────────
   return {
     init,
-    isActive,
-    isFreshChat,
+    timings,
     snapshot,
-    typeAndSend,
-    getLastAssistantMessage,
-    getLastAssistantNode,
-    getLastUserMessage,
-    getLastUserNode,
-    getTurnCounts,
-    waitForResponse,
+    allItems,
+    isUserItem,
+    isAssistantItem,
+    itemText,
+    classifyText,
+    assistantItems,
+    assistantCount,
+    userCount,
     getEditor,
     getSendBtn,
-    isGenerating,
     isStopBtn,
-    getContinueBtn,
-    checkForErrors,
-    getSiteName,
-    _S: S,
-    _timings: timings,
+    isGenerating,
   };
 })();
