@@ -270,7 +270,7 @@ function broadcastStatus() {
       for (const pattern of PROVIDER_URLS) {
         const regex = new RegExp(pattern.replace(/\*/g, ".*"));
         if (regex.test(url)) {
-          chrome.tabs.sendMessage(tab.id, { type: "status", status }).catch(() => {});
+          chrome.tabs.sendMessage(tab.id, { type: "zs-status", status }).catch(() => {});
           break;
         }
       }
