@@ -209,6 +209,27 @@ const ZSProvider = (() => {
     return url.includes('aistudio.xiaomimimo.com') || url.includes('ultraspeed.xiaomimimo.com');
   }
 
+  // isFreshChat: returns true if this is a new/empty conversation (no messages).
+  function isFreshChat() {
+    const items = allItems();
+    return items.length === 0;
+  }
+
+  // snapshot: returns a snapshot of the current conversation state for the core.
+  function snapshot() {
+    const items = allItems();
+    const users = items.filter(isUserItem);
+    const assistants = items.filter(isAssistantItem);
+    return {
+      total: items.length,
+      userCount: users.length,
+      assistantCount: assistants.length,
+      lastUserText: users.length > 0 ? itemText(users[users.length - 1]) : null,
+      lastAssistantText: assistants.length > 0 ? itemText(assistants[assistants.length - 1]) : null,
+      isFresh: items.length === 0,
+    };
+  }
+
   // typeAndSend: type the given text into the composer and send it.
   async function typeAndSend(text) {
     const editor = getEditor();
@@ -374,6 +395,8 @@ const ZSProvider = (() => {
   return {
     init,
     isActive,
+    isFreshChat,
+    snapshot,
     typeAndSend,
     getLastAssistantMessage,
     getLastAssistantNode,
