@@ -20,22 +20,25 @@ const ZSProvider = (() => {
 
   // DOM selectors for MiMo. Grouped so a future site tweak is a one-liner.
   const S = {
-    chatItem: ".chat-message, .message-item, [class*='message']",
-    userMod: "user", // class part for user messages
-    assistantMod: "assistant", // class part for assistant messages
-    box: ".markdown, [class*='markdown'], .message-content",
-    editor: "textarea", // MiMo uses a real <textarea>
-    thinking: ".thinking, .reasoning, [class*='think']",
-    markdown: ".markdown, [class*='markdown']",
+    // The message list container (scrollable area)
+    chatList: "#message-list",
+    // Each message item is a direct child of the chatList
+    chatItem: "> div", // direct child divs of the chatList
+    // User messages: they have a div with class 'bg-mimo-bg-message' or alignment 'justify-end'
+    userIndicator: ".bg-mimo-bg-message", // user bubble class
+    assistantIndicator: ".justify-start", // assistant alignment
+    userAlign: "justify-end",
+    assistantAlign: "justify-start",
+    // Text container for user messages
+    userText: ".whitespace-pre-wrap",
+    // Assistant text: sometimes inside <p> or .prose
+    assistantText: "p, .prose, .markdown",
+    // Composer
+    editor: "textarea[placeholder*='Ask me anything']",
+    sendBtn: "button[data-track-id='home_send_btn']",
+    stopBtn: "button[aria-label*='stop' i], button[class*='stop']",
     generating: ".loading, .streaming, [class*='generating']",
-    sendBtn: "button[type='submit'], .send-button, [class*='send']",
-    stopBtn: "button[class*='stop'], [class*='stop']",
-    // surfaces where MiMo shows errors / limit modals / toasts
-    errorSurfaces:
-      '[class*="toast"],[class*="error"],[class*="alert"],' +
-      '[class*="warning"],[class*="modal"],[role="alert"]',
-    attachArea: "[class*='file-list'], [class*='upload']",
-    imageThumb: "[class*='thumbnail'], [class*='file-item']",
+    errorSurfaces: '[role="alert"], [class*="error"], [class*="alert"], [class*="toast"]',
   };
 
   // Error / state regexes (English only - MiMo's UI is primarily English).
@@ -57,58 +60,73 @@ const ZSProvider = (() => {
     busy: /server is busy|please try again|system is currently busy/i,
     continueBtn: /^(continue|continuer|继续|fortfahren|continuar|seguir|続行)$/i,
     stopped: /(stopped|已停止|停止生成|已暂停)/i,
-    deepThink: /deep ?think|深度思考|r1|reasoning/i,
-    searchMode: /search|web|搜索/i,
   };
 
   // Completion-detection windows, calibrated for MiMo's typical response speed.
   const timings = {
-    GEN_IDLE_MS: 800,        // answer phase: text unchanged this long ⇒ idle
-    REASON_IDLE_MS: 10000,   // reasoning stalls
-    WARMUP_MS: 30000,        // empty turn container may precede the first token
-    REASON_NOREPLY_MS: 60000, // reasoning written but no answer yet: keep waiting
-    STABLE_MS: 8000,         // generating-flag stuck ON but text frozen → done
+    GEN_IDLE_MS: 800,
+    REASON_IDLE_MS: 10000,
+    WARMUP_MS: 30000,
+    REASON_NOREPLY_MS: 60000,
+    STABLE_MS: 8000,
     RESPONSE_TIMEOUT_MS: 300000,
   };
 
   // ── Turn classification ──────────────────────────────────────────────────
+  // Get all message items (direct children of the chat list)
+  function allItems() {
+    const list = document.querySelector(S.chatList);
+    if (!list) return [];
+    // Direct children that are divs (the message containers)
+    return [...list.children].filter(el => el.tagName === 'DIV');
+  }
+
   function isUserItem(item) {
     if (!item) return false;
-    // Check for user class or user bubble
-    if (item.classList.contains(S.userMod)) return true;
-    if (item.querySelector('[class*="user"]')) return true;
+    // Look for the user bubble class
+    if (item.querySelector(S.userIndicator)) return true;
+    // Or check alignment class
+    if (item.classList.contains(S.userAlign)) return true;
+    // Or check if it has a user-specific class (e.g., from Tailwind)
+    if (item.className.includes('justify-end')) return true;
     return false;
   }
+
   const isAssistantItem = (item) => !!item && !isUserItem(item);
 
-  // Text of an item for signature detection. For assistant turns we use ONLY
-  // the non-thinking markdown.
+  // Get the text content of a message item
   function itemText(item) {
     if (isAssistantItem(item)) {
-      const mds = [...item.querySelectorAll(S.markdown)].filter((m) => !m.closest(S.thinking));
-      return mds.map((m) => m.textContent).join("\n");
+      // Try to find the assistant text container: <p> or .prose or .markdown
+      const textContainer = item.querySelector(S.assistantText);
+      if (textContainer) return textContainer.textContent.trim();
+      // Fallback: all text excluding any child that might be a button or metadata
+      return item.textContent.trim();
+    } else {
+      // User message: find the .whitespace-pre-wrap or fallback to textContent
+      const textContainer = item.querySelector(S.userText);
+      if (textContainer) return textContainer.textContent.trim();
+      return item.textContent.trim();
     }
-    return item.textContent || "";
   }
 
   // Text used by the core to CLASSIFY a turn for camouflage - excludes the
   // reasoning area AND any element matching `excludeSel`.
   function classifyText(item, excludeSel) {
-    if (isAssistantItem(item)) {
-      return [...item.querySelectorAll(S.markdown)]
-        .filter((m) => !m.closest(S.thinking) && !(excludeSel && m.closest(excludeSel)))
-        .map((m) => m.textContent).join("\n");
+    // For simplicity, we return the same as itemText, but we could exclude
+    // elements with excludeSel if needed.
+    let text = itemText(item);
+    if (excludeSel) {
+      // Remove any content inside elements matching excludeSel
+      const temp = item.cloneNode(true);
+      const els = temp.querySelectorAll(excludeSel);
+      for (const el of els) el.remove();
+      text = temp.textContent.trim();
     }
-    let t = "";
-    for (const n of item.childNodes) {
-      if (excludeSel && n.nodeType === 1 && n.matches && n.matches(excludeSel)) continue;
-      t += n.textContent || "";
-    }
-    return t;
+    return text;
   }
 
   // ── DOM primitives ──────────────────────────────────────────────────────
-  const allItems = () => [...document.querySelectorAll(S.chatItem)];
   const assistantItems = () => allItems().filter(isAssistantItem);
   const assistantCount = () => assistantItems().length;
   const userCount = () => allItems().filter(isUserItem).length;
@@ -118,28 +136,24 @@ const ZSProvider = (() => {
   function getEditor() {
     const editors = document.querySelectorAll(S.editor);
     for (const e of editors) {
-      // Skip any textarea that is inside our own injected UI (#zs-root)
       if (e.closest('#zs-root')) continue;
-      // Also skip if it's not visible or disabled
       if (e.offsetParent === null && e.closest('[style*="display:none"]')) continue;
       return e;
     }
     return null;
   }
 
-  // Get the primary send button (the one that triggers the message).
+  // Get the primary send button
   function getSendBtn() {
-    // Look for a button with type="submit" or class containing "send"
     const btns = document.querySelectorAll(S.sendBtn);
     for (const b of btns) {
       if (b.closest('#zs-root')) continue;
-      // Prefer visible, enabled buttons
       if (b.offsetParent !== null && !b.disabled) return b;
     }
-    // Fallback: any button inside the composer area
+    // Fallback: any button inside the composer with type submit
     const composer = document.querySelector('[class*="composer"], [class*="input-area"]');
     if (composer) {
-      const btn = composer.querySelector('button:not([disabled])');
+      const btn = composer.querySelector('button[type="submit"], button:not([disabled])');
       if (btn) return btn;
     }
     return null;
@@ -148,17 +162,14 @@ const ZSProvider = (() => {
   // Determine if the primary button is in "stop" state (generating).
   function isStopBtn(btn) {
     if (!btn) return false;
-    // Check for stop-related classes or text content
     if (btn.classList.contains('stop') || btn.classList.contains('stopping')) return true;
     const txt = btn.textContent.trim().toLowerCase();
     if (txt === 'stop' || txt === '■' || txt === '⏹' || txt.includes('stop')) return true;
-    // Some sites use an SVG path; check for stop icon (square or rectangle)
     const svg = btn.querySelector('svg');
     if (svg) {
       const path = svg.querySelector('path');
       if (path) {
         const d = path.getAttribute('d') || '';
-        // Stop icon often has a square path like "M2 2h20v20H2z"
         if (d.match(/M\s*\d+\s+\d+\s+h\s*\d+/i)) return true;
       }
     }
@@ -167,12 +178,9 @@ const ZSProvider = (() => {
 
   // Check if the UI indicates the model is currently generating.
   function isGenerating() {
-    // Look for a loading/generating class
     if (document.querySelector(S.generating)) return true;
-    // Check the button state
     const btn = getSendBtn();
     if (btn && isStopBtn(btn)) return true;
-    // Check for a spinner or thinking indicator
     if (document.querySelector('[class*="spinner"], [class*="thinking"]')) return true;
     return false;
   }
@@ -209,23 +217,19 @@ const ZSProvider = (() => {
       return false;
     }
 
-    // Focus and set value
     editor.focus();
     editor.value = text;
-    // Dispatch input event to trigger any reactivity
     editor.dispatchEvent(new Event('input', { bubbles: true }));
 
-    // Wait a tiny bit for the UI to update
     await sleep(100);
 
-    // Find and click the send button
     const sendBtn = getSendBtn();
     if (sendBtn) {
       sendBtn.click();
       return true;
     }
 
-    // Fallback: try pressing Enter (if the textarea triggers submit on Enter)
+    // Fallback: try pressing Enter
     editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     return true;
   }
@@ -250,7 +254,7 @@ const ZSProvider = (() => {
     const items = allItems().filter(isUserItem);
     if (items.length === 0) return null;
     const last = items[items.length - 1];
-    return last.textContent || null;
+    return itemText(last);
   }
 
   // getLastUserNode: returns the DOM node of the latest user turn.
@@ -271,14 +275,11 @@ const ZSProvider = (() => {
     const start = Date.now();
     const timeout = timeoutMs || timings.RESPONSE_TIMEOUT_MS;
 
-    // Wait for the last assistant message to stabilize.
     let lastText = '';
     let stableStart = 0;
     let idleStart = 0;
-    let generatingDetected = false;
 
     while (Date.now() - start < timeout) {
-      // Check for errors
       if (checkForErrors()) {
         diag('[MiMo] Error detected, stopping wait');
         return null;
@@ -286,7 +287,6 @@ const ZSProvider = (() => {
 
       const items = assistantItems();
       if (items.length === 0) {
-        // No assistant turn yet; wait a bit
         await sleep(200);
         continue;
       }
@@ -294,13 +294,11 @@ const ZSProvider = (() => {
       const latest = items[items.length - 1];
       const text = itemText(latest);
 
-      // If text is empty, it might be a placeholder; wait for content
       if (!text.trim()) {
         await sleep(200);
         continue;
       }
 
-      // Check if we have a "Continue" button (model is waiting for user action)
       const contBtn = getContinueBtn();
       if (contBtn) {
         diag('[MiMo] Continue button detected, clicking it');
@@ -309,18 +307,13 @@ const ZSProvider = (() => {
         continue;
       }
 
-      // Check generating status
       const gen = isGenerating();
       if (gen) {
-        generatingDetected = true;
-        // Reset idle timer when we see generating activity
         idleStart = 0;
-        // If text has changed, reset stable timer
         if (text !== lastText) {
           stableStart = 0;
           lastText = text;
         } else {
-          // Text unchanged while generating: if it stays frozen too long, consider done
           if (stableStart === 0) stableStart = Date.now();
           if (Date.now() - stableStart > timings.STABLE_MS) {
             diag('[MiMo] Text frozen while generating, assuming done');
@@ -328,7 +321,6 @@ const ZSProvider = (() => {
           }
         }
       } else {
-        // Not generating: if we have text, check if it's stable
         if (lastText && text === lastText) {
           if (idleStart === 0) idleStart = Date.now();
           if (Date.now() - idleStart > timings.GEN_IDLE_MS) {
@@ -336,13 +328,11 @@ const ZSProvider = (() => {
             return lastText;
           }
         } else {
-          // Text changed while not generating? maybe it's still streaming but the flag is missing
           idleStart = 0;
           lastText = text;
         }
       }
 
-      // If we've waited a long time and have some text, return it
       if (lastText.trim() && Date.now() - start > 30000) {
         diag('[MiMo] Long wait with text, returning what we have');
         return lastText;
@@ -351,7 +341,6 @@ const ZSProvider = (() => {
       await sleep(500);
     }
 
-    // Timeout: return what we have, if anything
     const finalText = getLastAssistantMessage();
     if (finalText) {
       diag('[MiMo] Timeout but returning last message');
@@ -399,7 +388,6 @@ const ZSProvider = (() => {
     getContinueBtn,
     checkForErrors,
     getSiteName,
-    // Expose selectors and timings for debugging
     _S: S,
     _timings: timings,
   };
