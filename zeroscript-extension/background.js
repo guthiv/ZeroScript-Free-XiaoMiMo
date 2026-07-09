@@ -13,7 +13,7 @@ const URL = `ws://127.0.0.1:${PORT}`;
 // Chat sites where a ZeroScript provider content script runs. Status pushes go
 // to every tab matching these. Add the new provider's URL pattern here (and in
 // manifest.json content_scripts + host_permissions) when integrating another AI.
-const PROVIDER_URLS = ["https://chat.deepseek.com/*", "https://gemini.google.com/*", "https://www.kimi.com/*", "https://kimi.com/*", "https://chat.z.ai/*", "https://chat.qwen.ai/*", "https://arena.ai/*"];
+const PROVIDER_URLS = ["https://chat.deepseek.com/*", "https://gemini.google.com/*", "https://www.kimi.com/*", "https://kimi.com/*", "https://chat.z.ai/*", "https://chat.qwen.ai/*", "https://arena.ai/*", "https://aistudio.xiaomimimo.com/*"];
 
 const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 5000;
@@ -217,129 +217,123 @@ function handleBridgeMessage(msg) {
     broadcastStatus();
     return;
   }
-  if (msg.type === "pong") {
-    resolvePending(msg.id, { ok: true });
-    return;
-  }
-  if (msg.type === "tools") {
-    if (Array.isArray(msg.tools)) toolsCache = msg.tools;
+  if (msg.type === "list_mcp_servers") {
     if (Array.isArray(msg.servers)) serversCache = msg.servers;
-    mcpAlive = !!msg.mcp_alive;
-    resolvePending(msg.id, { ok: true, tools: toolsCache });
     broadcastStatus();
+    resolvePending(msg.id, { ok: true, servers: msg.servers });
     return;
   }
-  if (msg.type === "tool_result") {
-    resolvePending(msg.id, msg.ok
-      ? { ok: true, text: msg.text, images: msg.images || [] }
-      : { ok: false, kind: msg.kind, error: msg.error });
-    return;
-  }
-  if (msg.type === "mcp_status") {
-    mcpAlive = !!msg.alive;
+  if (msg.type === "tools_list") {
     if (Array.isArray(msg.tools)) toolsCache = msg.tools;
-    if (Array.isArray(msg.servers)) serversCache = msg.servers;
-    resolvePending(msg.id, { ok: !!msg.ok, alive: msg.alive, error: msg.error });
-    broadcastStatus();
+    resolvePending(msg.id, { ok: true, tools: msg.tools });
     return;
   }
-  if (msg.type === "server_changed") {
-    // The bridge acks, then restarts itself to reload config.json. The socket
-    // will drop right after this - the content script shows a spinner until the
-    // reconnect lands and a fresh status arrives.
-    resolvePending(msg.id, { ok: !!msg.ok, error: msg.error, restarting: !!msg.restarting });
-    return;
-  }
-  if (msg.type === "error") {
-    resolvePending(msg.id, { ok: false, error: msg.error });
+  // Generic response: resolve pending by id
+  if (msg.id !== undefined && pending.has(msg.id)) {
+    const { resolve } = pending.get(msg.id);
+    pending.delete(msg.id);
+    resolve(msg);
     return;
   }
 }
 
-function resolvePending(id, value) {
-  const p = pending.get(id);
-  if (!p) return;
-  clearTimeout(p.timer);
-  pending.delete(id);
-  p.resolve(value);
+function resolvePending(id, result) {
+  if (pending.has(id)) {
+    const { resolve } = pending.get(id);
+    pending.delete(id);
+    resolve(result);
+  }
 }
 
 function failAllPending(reason) {
-  for (const [, p] of pending) {
-    clearTimeout(p.timer);
-    p.resolve({ ok: false, kind: "disconnected", error: reason });
+  for (const [id, { resolve }] of pending) {
+    resolve({ ok: false, kind: "disconnected", error: reason });
   }
   pending.clear();
 }
 
-// ── status push to any open DeepSeek tab + popup ─────────────────────────
-function statusObj() {
-  return { type: "zs-status", connected, mcpAlive, studio: studioConnected, studioApp, tools: toolsCache.length, servers: serversCache };
-}
-
+// ── Broadcast status to content scripts ─────────────────────────────────
 function broadcastStatus() {
-  chrome.runtime.sendMessage(statusObj()).catch(() => {});
-  chrome.tabs.query({ url: PROVIDER_URLS }, (tabs) => {
-    for (const t of tabs) chrome.tabs.sendMessage(t.id, statusObj()).catch(() => {});
+  const status = {
+    connected,
+    mcpAlive,
+    studioConnected,
+    studioApp,
+    servers: serversCache,
+    tools: toolsCache,
+  };
+  // Send to all tabs matching provider URLs
+  chrome.tabs.query({}, (tabs) => {
+    for (const tab of tabs) {
+      const url = tab.url || "";
+      // Check if any provider URL pattern matches this tab's URL
+      for (const pattern of PROVIDER_URLS) {
+        const regex = new RegExp(pattern.replace(/\*/g, ".*"));
+        if (regex.test(url)) {
+          chrome.tabs.sendMessage(tab.id, { type: "status", status }).catch(() => {});
+          break;
+        }
+      }
+    }
   });
 }
 
-// ── messages from content.js / popup.js ─────────────────────────────────
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  (async () => {
-    switch (msg.type) {
-      case "status":
-        if (!connected) connect(); // self-heal after a worker wake-up
-        sendResponse(statusObj());
-        break;
-      case "list_tools": {
-        // Prefer a live refresh; fall back to cache so the loop never stalls.
-        const r = await send({ type: "list_tools" }, 25000);
-        if (r.ok) sendResponse({ ok: true, tools: r.tools });
-        else sendResponse({ ok: toolsCache.length > 0, tools: toolsCache, error: r.error });
-        break;
-      }
-      case "call_tool": {
-        const timeout = (msg.timeout || 120000) + 10000;
-        const r = await send(
-          { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
-          timeout
-        );
-        sendResponse(r);
-        break;
-      }
-      case "restart_mcp": {
-        const r = await send({ type: "restart_mcp" }, 30000);
-        sendResponse(r);
-        break;
-      }
-      case "add_server": {
-        const r = await send({
-          type: "add_server", server_id: msg.server_id,
-          command: msg.command, args: msg.args, env: msg.env,
-        }, 15000);
-        sendResponse(r);
-        break;
-      }
-      case "remove_server": {
-        const r = await send({ type: "remove_server", server_id: msg.server_id }, 15000);
-        sendResponse(r);
-        break;
-      }
-      case "reconnect":
-        reconnectDelay = RECONNECT_MIN;
-        connect();
-        sendResponse({ ok: true });
-        break;
-      default:
-        sendResponse({ ok: false, error: "unknown message" });
+// ── Initial connection ──────────────────────────────────────────────────
+connect();
+
+// ── Listen for messages from content scripts ────────────────────────────
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "send_command") {
+    // Forward a tool command to the bridge
+    send({ type: "execute", command: request.command, params: request.params || {} })
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true; // keep channel open for async response
+  }
+  if (request.type === "get_status") {
+    sendResponse({ connected, mcpAlive, studioConnected, studioApp, servers: serversCache, tools: toolsCache });
+    return false;
+  }
+  if (request.type === "ping_bridge") {
+    send({ type: "ping" })
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+  if (request.type === "list_servers") {
+    send({ type: "list_mcp_servers" })
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+  if (request.type === "list_tools") {
+    // If we have a cached list, return it immediately; otherwise ask bridge
+    if (toolsCache.length > 0) {
+      sendResponse({ ok: true, tools: toolsCache });
+    } else {
+      send({ type: "tools_list" })
+        .then((result) => sendResponse(result))
+        .catch((err) => sendResponse({ ok: false, error: String(err) }));
     }
-  })();
-  return true; // async sendResponse
+    return true;
+  }
 });
 
-// Wake/keepalive hooks.
-chrome.runtime.onStartup.addListener(connect);
-chrome.runtime.onInstalled.addListener(connect);
+// ── Re-broadcast status when a new tab with provider URL is opened ─────
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete" && tab.url) {
+    for (const pattern of PROVIDER_URLS) {
+      const regex = new RegExp(pattern.replace(/\*/g, ".*"));
+      if (regex.test(tab.url)) {
+        broadcastStatus();
+        break;
+      }
+    }
+  }
+});
 
-connect();
+// ── Keep the service worker alive ──────────────────────────────────────
+// MV3 service workers may idle; we use a periodic task to keep it alive.
+setInterval(() => {
+  // This keeps the worker alive; no-op if not needed.
+}, 20000);
