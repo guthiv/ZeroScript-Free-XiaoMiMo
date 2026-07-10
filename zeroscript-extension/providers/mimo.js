@@ -23,8 +23,8 @@ const ZSProvider = (() => {
   const S = {
     // The message list container (scrollable area)
     chatList: "#message-list, [class*='message-list'], [class*='chat-list'], [class*='messages']",
-    // Each message item is a direct child of the chatList
-    chatItem: "> div", // direct child divs of the chatList
+    // Each message item - now uses a more robust direct-child + class fallback approach
+    chatItem: "> div, > [class*='message-item'], > [class*='chat-message'], > [class*='MessageItem']",
     // User messages: they have a div with class 'bg-mimo-bg-message' or alignment 'justify-end'
     userIndicator: ".bg-mimo-bg-message, [class*='user-message'], [class*='userMessage']",
     assistantIndicator: ".justify-start, [class*='assistant-message'], [class*='assistantMessage']",
@@ -35,9 +35,6 @@ const ZSProvider = (() => {
     // Assistant text: sometimes inside <p> or .prose
     assistantText: "p, .prose, .markdown, [class*='message-content'], [class*='assistant-text']",
     // Composer - multiple fallbacks for different MiMo versions.
-    // CRITICAL: MiMo uses a React-controlled <textarea>. We MUST trigger
-    // the native setter + dispatch an 'input' Event (bubbles: true) so
-    // React's synthetic event system picks it up.
     editor: [
       "textarea[placeholder*='Ask me anything']",
       "textarea[placeholder*='ask']",
@@ -50,14 +47,11 @@ const ZSProvider = (() => {
       "textarea[placeholder*='type']",
       "textarea[placeholder*='Type']",
       "textarea[placeholder]",
-      // Last resort: ANY textarea NOT inside our own UI
       "textarea:not(#zs-root textarea)",
       "[contenteditable='true'][role='textbox']:not(#zs-root *)",
       "[contenteditable='true']:not(#zs-root *)",
     ].join(", "),
-    // Send button - multiple fallbacks. MiMo standard uses a button with
-    // a specific aria-label or data attribute. All selectors exclude our
-    // own ZeroScript UI (#zs-root) to avoid false matches.
+    // Send button - all scoped with :not(#zs-root *) to avoid targeting ZeroScript UI.
     sendBtn: [
       "button[data-track-id='home_send_btn']:not(#zs-root *)",
       "button[data-track-id*='send']:not(#zs-root *)",
@@ -68,16 +62,13 @@ const ZSProvider = (() => {
       "button.send-btn:not(#zs-root *)",
       "button[class*='send']:not(#zs-root *)",
       "button[class*='Send']:not(#zs-root *)",
-      // Fallback: button with an SVG child (arrow icon) - safe JS fallback, not :has()
     ].join(", "),
-    stopBtn: "button[aria-label*='stop' i]:not(#zs-root *), button[class*='stop']:not(#zs-root *), button[class*='Stop']:not(#zs-root *)",
+    stopBtn: "button[aria-label*='stop' i], button[class*='stop'], button[class*='Stop']",
     generating: ".loading, .streaming, [class*='generating'], [class*='thinking'], [class*='streaming']",
     errorSurfaces: '[role="alert"], [class*="error"], [class*="alert"], [class*="toast"]',
-    // Composer container (for scoping button/editor searches)
     composer: "[class*='composer'], [class*='input-area'], [class*='inputArea'], [class*='footer'], [class*='chat-input'], [class*='chatInput']",
   };
 
-  // Error / state regexes (English only - MiMo's UI is primarily English).
   const RE = {
     contextLimit: new RegExp(
       [
@@ -98,7 +89,6 @@ const ZSProvider = (() => {
     stopped: /(stopped|已停止|停止生成|已暂停)/i,
   };
 
-  // Completion-detection windows, calibrated for MiMo's typical response speed.
   const timings = {
     GEN_IDLE_MS: 800,
     REASON_IDLE_MS: 10000,
@@ -108,46 +98,34 @@ const ZSProvider = (() => {
     RESPONSE_TIMEOUT_MS: 300000,
   };
 
-  // ── Turn classification ──────────────────────────────────────────────────
-  // Get all message items (direct children of the chat list)
   function allItems() {
     const list = document.querySelector(S.chatList);
     if (!list) return [];
-    // Direct children that are divs (the message containers)
     return [...list.children].filter(el => el.tagName === 'DIV');
   }
 
   function isUserItem(item) {
     if (!item) return false;
-    // Look for the user bubble class
     if (item.querySelector(S.userIndicator)) return true;
-    // Or check alignment class
     if (item.classList.contains(S.userAlign)) return true;
-    // Or check if it has a user-specific class (e.g., from Tailwind)
-    if (item.className.includes('justify-end')) return true;
+    if (item.className && item.className.includes && item.className.includes('justify-end')) return true;
     return false;
   }
 
   const isAssistantItem = (item) => !!item && !isUserItem(item);
 
-  // Get the text content of a message item
   function itemText(item) {
     if (isAssistantItem(item)) {
-      // Try to find the assistant text container: <p> or .prose or .markdown
       const textContainer = item.querySelector(S.assistantText);
       if (textContainer) return textContainer.textContent.trim();
-      // Fallback: all text excluding any child that might be a button or metadata
       return item.textContent.trim();
     } else {
-      // User message: find the .whitespace-pre-wrap or fallback to textContent
       const textContainer = item.querySelector(S.userText);
       if (textContainer) return textContainer.textContent.trim();
       return item.textContent.trim();
     }
   }
 
-  // Text used by the core to CLASSIFY a turn for camouflage - excludes the
-  // reasoning area AND any element matching `excludeSel`.
   function classifyText(item, excludeSel) {
     let text = itemText(item);
     if (excludeSel) {
@@ -159,139 +137,118 @@ const ZSProvider = (() => {
     return text;
   }
 
-  // ── DOM primitives ──────────────────────────────────────────────────────
   const assistantItems = () => allItems().filter(isAssistantItem);
   const assistantCount = () => assistantItems().length;
   const userCount = () => allItems().filter(isUserItem).length;
 
-  function lastAssistant() {
-    const items = assistantItems();
-    return items.length ? items[items.length - 1] : null;
-  }
-
-  function lastUser() {
-    const items = allItems().filter(isUserItem);
-    return items.length ? items[items.length - 1] : null;
-  }
-
-  // ── Input / composer ────────────────────────────────────────────────────
-  function editor() {
-    // Scope search to composer container first for reliability
-    const composer = document.querySelector(S.composer);
-    const scope = composer || document;
-    const el = scope.querySelector(S.editor);
-    return el;
-  }
-
-  // Find send button - with JS fallback for SVG-icon buttons (no :has())
-  function findSendBtn() {
-    // Try CSS selectors first (excluding our own UI)
-    for (const sel of S.sendBtn.split(", ")) {
+  function findEditor() {
+    const sel = S.editor;
+    const selectors = sel.split(", ").map(s => s.trim());
+    for (const s of selectors) {
       try {
-        const el = document.querySelector(sel);
-        if (el && !el.closest('#zs-root')) return el;
-      } catch (e) {
-        // Skip invalid selectors silently
-      }
-    }
-    // JS fallback: find buttons with SVG children (the send arrow icon)
-    // MiMo standard uses a button containing an SVG in the footer area
-    const composer = document.querySelector(S.composer);
-    const scope = composer || document;
-    const buttons = scope.querySelectorAll('button');
-    for (const btn of buttons) {
-      if (btn.closest('#zs-root')) continue;
-      if (btn.querySelector('svg')) return btn;
+        const el = document.querySelector(s);
+        if (el && !el.closest("#zs-root")) return el;
+      } catch (e) { continue; }
     }
     return null;
   }
 
-  function isGenerating() {
-    // Check for loading/thinking indicators
-    if (document.querySelector(S.generating)) return true;
-    // Check if send button shows a stop icon (meaning generation is active)
-    const btn = findSendBtn();
-    if (!btn) return false;
-    // If the primary button contains a stop/square icon instead of arrow
-    const svg = btn.querySelector('svg');
-    if (!svg) return false;
-    // Stop icons typically have rect or a square shape
-    const hasRect = svg.querySelector('rect');
-    // Send icons typically have path (arrow)
-    const hasPath = svg.querySelector('path');
-    // If it has a rect (stop button) and no arrow path, it's generating
-    if (hasRect && !hasPath) return true;
-    return false;
-  }
-
-  async function typeAndSend(text, opts = {}) {
-    const ed = editor();
-    if (!ed) throw new Error("MiMo editor not found");
-    // Focus the editor
-    ed.focus();
-    await sleep(100);
-    // Set value using native setter for React
-    const nativeSetter = Object.getOwnPropertyDescriptor(
-      HTMLTextAreaElement.prototype, 'value'
-    ).set;
-    nativeSetter.call(ed, text);
-    ed.dispatchEvent(new Event('input', { bubbles: true }));
-    await sleep(200);
-    // Find and click send button
-    const btn = findSendBtn();
-    if (!btn) throw new Error("MiMo send button not found");
-    btn.click();
-  }
-
-  function stopGeneration() {
-    const stopBtn = document.querySelector(S.stopBtn);
-    if (stopBtn && !stopBtn.closest('#zs-root')) {
-      stopBtn.click();
-      return true;
+  function findSendBtn() {
+    const sel = S.sendBtn;
+    const selectors = sel.split(", ").map(s => s.trim());
+    for (const s of selectors) {
+      try {
+        const el = document.querySelector(s);
+        if (el && !el.closest("#zs-root")) return el;
+      } catch (e) { continue; }
     }
-    return false;
+    // Fallback: find any button containing an SVG (send icon) without :has()
+    const buttons = document.querySelectorAll("button:not(#zs-root *)");
+    for (const btn of buttons) {
+      if (btn.closest("#zs-root")) continue;
+      if (btn.querySelector("svg")) return btn;
+    }
+    return null;
   }
 
-  // ── Snapshot / identity ─────────────────────────────────────────────────
-  function snapshot() {
-    return {
-      assistantCount: assistantCount(),
-      userCount: userCount(),
-      generating: isGenerating(),
-    };
-  }
-
-  function conversationKey() {
-    const items = allItems();
-    if (!items.length) return null;
-    // Use first user message as key
-    const firstUser = items.find(isUserItem);
-    if (!firstUser) return null;
-    return itemText(firstUser).slice(0, 100);
-  }
-
-  // ── Public interface ────────────────────────────────────────────────────
-  return {
+  const P = {
+    name: () => "MiMo",
     timings,
+
     init(opts) {
       if (opts && opts.diag) diag = opts.diag;
+      diag("mimo_init", {});
     },
-    allItems,
-    isUserItem,
-    isAssistantItem,
-    itemText,
-    classifyText,
-    assistantItems,
-    assistantCount,
-    userCount,
-    lastAssistant,
-    lastUser,
-    editor,
-    findSendBtn,
-    isGenerating,
-    typeAndSend,
-    stopGeneration,
-    snapshot,
-    conversationKey,
+
+    snapshot() {
+      const items = allItems();
+      const key = items.length ? `${items.length}:${itemText(items[0]).slice(0, 40)}` : "empty";
+      return { items: items.length, key };
+    },
+
+    isGenerating() {
+      if (document.querySelector(S.generating)) return true;
+      const stopBtn = document.querySelector(S.stopBtn);
+      if (stopBtn && stopBtn.offsetParent !== null) return true;
+      return false;
+    },
+
+    async stop() {
+      const btn = document.querySelector(S.stopBtn);
+      if (btn) btn.click();
+    },
+
+    async typeAndSend(text) {
+      const editor = findEditor();
+      if (!editor) throw new Error("Could not find MiMo input field");
+      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      nativeSetter.call(editor, text);
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(100);
+      const sendBtn = findSendBtn();
+      if (sendBtn) {
+        sendBtn.click();
+      } else {
+        editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+      }
+      diag("mimo_send", { textLen: text.length });
+    },
+
+    async waitForReply() {
+      const startCount = assistantCount();
+      const timeout = timings.RESPONSE_TIMEOUT_MS;
+      const start = Date.now();
+      return new Promise((resolve) => {
+        const check = () => {
+          const currentCount = assistantCount();
+          if (currentCount > startCount) {
+            const items = assistantItems();
+            const last = items[items.length - 1];
+            if (last) { waitForGenFinish(last).then((text) => resolve(text)); return; }
+          }
+          if (Date.now() - start > timeout) { resolve("(No response from MiMo within timeout)"); return; }
+          setTimeout(check, 500);
+        };
+        check();
+      });
+    },
   };
+
+  async function waitForGenFinish(item) {
+    const maxWait = timings.RESPONSE_TIMEOUT_MS;
+    const start = Date.now();
+    let lastLen = 0, stableCount = 0;
+    while (Date.now() - start < maxWait) {
+      const currentText = itemText(item);
+      if (currentText.length === lastLen && !P.isGenerating()) {
+        stableCount++;
+        if (stableCount >= 3) return currentText;
+      } else { stableCount = 0; }
+      lastLen = currentText.length;
+      await sleep(timings.GEN_IDLE_MS / 2);
+    }
+    return itemText(item);
+  }
+
+  return P;
 })();
