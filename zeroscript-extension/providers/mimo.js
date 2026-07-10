@@ -34,7 +34,10 @@ const ZSProvider = (() => {
     userText: ".whitespace-pre-wrap, [class*='message-content'], [class*='user-text']",
     // Assistant text: sometimes inside <p> or .prose
     assistantText: "p, .prose, .markdown, [class*='message-content'], [class*='assistant-text']",
-    // Composer - multiple fallbacks for different MiMo versions
+    // Composer - multiple fallbacks for different MiMo versions.
+    // CRITICAL: MiMo uses a React-controlled <textarea>. We MUST trigger
+    // the native setter + dispatch an 'input' Event (bubbles: true) so
+    // React's synthetic event system picks it up.
     editor: [
       "textarea[placeholder*='Ask me anything']",
       "textarea[placeholder*='ask']",
@@ -47,20 +50,25 @@ const ZSProvider = (() => {
       "textarea[placeholder*='type']",
       "textarea[placeholder*='Type']",
       "textarea[placeholder]",
-      "textarea",
-      "[contenteditable='true'][role='textbox']",
-      "[contenteditable='true']",
+      // Last resort: ANY textarea NOT inside our own UI
+      "textarea:not(#zs-root textarea)",
+      "[contenteditable='true'][role='textbox']:not(#zs-root *)",
+      "[contenteditable='true']:not(#zs-root *)",
     ].join(", "),
-    // Send button - multiple fallbacks
+    // Send button - multiple fallbacks. MiMo standard uses a button with
+    // a specific aria-label or data attribute.
     sendBtn: [
       "button[data-track-id='home_send_btn']",
       "button[data-track-id*='send']",
       "button[aria-label*='send' i]",
       "button[aria-label*='Send' i]",
+      "button[aria-label*='submit' i]",
       "button[type='submit']",
       "button.send-btn",
       "button[class*='send']",
       "button[class*='Send']",
+      // MiMo standard: a button with an SVG icon (arrow)
+      "button:has(svg)",
     ].join(", "),
     stopBtn: "button[aria-label*='stop' i], button[class*='stop'], button[class*='Stop']",
     generating: ".loading, .streaming, [class*='generating'], [class*='thinking'], [class*='streaming']",
@@ -141,11 +149,8 @@ const ZSProvider = (() => {
   // Text used by the core to CLASSIFY a turn for camouflage - excludes the
   // reasoning area AND any element matching `excludeSel`.
   function classifyText(item, excludeSel) {
-    // For simplicity, we return the same as itemText, but we could exclude
-    // elements with excludeSel if needed.
     let text = itemText(item);
     if (excludeSel) {
-      // Remove any content inside elements matching excludeSel
       const temp = item.cloneNode(true);
       const els = temp.querySelectorAll(excludeSel);
       for (const el of els) el.remove();
@@ -162,248 +167,191 @@ const ZSProvider = (() => {
   // Get the main textarea (composer). Scope to the site's composer only;
   // avoid matching ZeroScript's own injected UI.
   function getEditor() {
-    // Try each selector in the comma-separated list individually
     const selectors = S.editor.split(", ");
     for (const sel of selectors) {
       try {
-        const editors = document.querySelectorAll(sel);
-        for (const e of editors) {
-          // Skip our own UI
-          if (e.closest('#zs-root')) continue;
-          // Skip hidden elements
-          if (e.offsetParent === null && e.closest('[style*="display:none"]')) continue;
-          // For textareas, they must be visible
-          if (e.tagName === 'TEXTAREA' && e.offsetParent !== null) return e;
-          // For contenteditable
-          if (e.getAttribute('contenteditable') === 'true') {
-            if (e.offsetParent !== null) return e;
+        const all = document.querySelectorAll(sel);
+        for (const el of all) {
+          // Skip elements inside ZeroScript's own UI
+          if (el.closest('#zs-root')) continue;
+          // For broad fallback selectors, ensure it's visible
+          if (sel.includes(':not') || sel === "textarea") {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
           }
+          return el;
         }
-      } catch (_) {
-        // selector might be invalid - skip to next
+      } catch (e) {
+        continue;
       }
     }
-
-    // Last resort: find ANY visible textarea not in our UI
-    const allTextareas = document.querySelectorAll('textarea');
-    for (const t of allTextareas) {
-      if (t.closest('#zs-root')) continue;
-      if (t.offsetParent !== null && !t.disabled) return t;
-    }
-
-    // Try contenteditable as final fallback
-    const editables = document.querySelectorAll('[contenteditable="true"]');
-    for (const e of editables) {
-      if (e.closest('#zs-root')) continue;
-      if (e.offsetParent !== null) return e;
-    }
-
     return null;
   }
 
-  // Get the primary send button
-  function getSendBtn() {
-    // Try each selector individually
+  // Get the composer container (for bar placement)
+  function getComposer() {
+    // Try the composer selectors first
+    const selectors = S.composer.split(", ");
+    for (const sel of selectors) {
+      try {
+        const el = document.querySelector(sel);
+        if (el && !el.closest('#zs-root')) return el;
+      } catch (e) { continue; }
+    }
+    // Fallback: find the textarea's closest container
+    const editor = getEditor();
+    if (editor) {
+      let el = editor.parentElement;
+      while (el && el !== document.body) {
+        const cn = el.className || '';
+        if (typeof cn === 'string' &&
+            (cn.includes('composer') || cn.includes('input') ||
+             cn.includes('footer') || cn.includes('chat'))) {
+          return el;
+        }
+        el = el.parentElement;
+      }
+      return editor.parentElement;
+    }
+    return null;
+  }
+
+  function getSendButton() {
     const selectors = S.sendBtn.split(", ");
     for (const sel of selectors) {
       try {
-        const btns = document.querySelectorAll(sel);
-        for (const b of btns) {
-          if (b.closest('#zs-root')) continue;
-          if (b.offsetParent !== null && !b.disabled) return b;
+        const all = document.querySelectorAll(sel);
+        for (const el of all) {
+          if (el.closest('#zs-root')) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) return el;
         }
-      } catch (_) {
-        // selector might be invalid - skip to next
-      }
+      } catch (e) { continue; }
     }
-
-    // Fallback: any button inside the composer that looks like a submit/send button
-    const composer = document.querySelector(S.composer);
-    if (composer) {
-      const btn = composer.querySelector('button[type="submit"], button:not([disabled])');
-      if (btn) return btn;
-    }
-
-    // Last resort: find the last visible button near the textarea that looks like a submit
-    const editor = getEditor();
-    if (editor) {
-      const container = editor.closest('form') || editor.closest('[class*="composer"]') || editor.closest('[class*="input"]') || editor.parentElement;
-      if (container) {
-        const btns = container.querySelectorAll('button:not([disabled])');
-        for (const b of btns) {
-          if (b.closest('#zs-root')) continue;
-          if (b.offsetParent !== null) return b;
-        }
-      }
-    }
-
     return null;
   }
 
-  // Determine if the primary button is in "stop" state (generating).
-  function isStopBtn(btn) {
-    if (!btn) return false;
-    if (btn.classList.contains('stop') || btn.classList.contains('stopping')) return true;
-    const txt = btn.textContent.trim().toLowerCase();
-    if (txt === 'stop' || txt === '■' || txt === '⏹' || txt.includes('stop')) return true;
-    const svg = btn.querySelector('svg');
-    if (svg) {
-      const path = svg.querySelector('path');
-      if (path) {
-        const d = path.getAttribute('d') || '';
-        if (d.match(/M\s*\d+\s+\d+\s+h\s*\d+/i)) return true;
-      }
-    }
-    return false;
-  }
-
-  // Check if the UI indicates the model is currently generating.
   function isGenerating() {
-    if (document.querySelector(S.generating)) return true;
-    const btn = getSendBtn();
-    if (btn && isStopBtn(btn)) return true;
-    return false;
-  }
-
-  // Stop the current generation if possible.
-  function stopGeneration() {
-    // Try the stop button selectors
+    // Check for stop button presence (indicates generation in progress)
     const stopBtns = document.querySelectorAll(S.stopBtn);
-    for (const b of stopBtns) {
-      if (b.closest('#zs-root')) continue;
-      if (b.offsetParent !== null) {
-        b.click();
-        return true;
+    for (const btn of stopBtns) {
+      if (!btn.closest('#zs-root')) {
+        const rect = btn.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return true;
       }
     }
-    // Try the send button (which turns into a stop button during generation)
-    const btn = getSendBtn();
-    if (btn && isStopBtn(btn)) {
-      btn.click();
-      return true;
+    // Check for loading/streaming indicators
+    const genEls = document.querySelectorAll(S.generating);
+    for (const el of genEls) {
+      if (!el.closest('#zs-root')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return true;
+      }
     }
     return false;
   }
 
-  // ── Compose & send ───────────────────────────────────────────────────────
-  // Type text into the composer and send it.
-  async function typeAndSend(text, images) {
+  // ── Input primitives ────────────────────────────────────────────────────
+  // MiMo uses React. To set the textarea value, we MUST:
+  // 1. Use the native value setter (Object.getOwnPropertyDescriptor)
+  // 2. Dispatch an 'input' Event (bubbles: true) so React's synthetic
+  //    event system picks up the change and updates its internal state.
+  function typeIn(editor, text) {
+    if (!editor) return;
+    editor.focus();
+    // Use the native setter to bypass React's controlled component
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype, 'value'
+    );
+    if (nativeSetter && nativeSetter.set) {
+      nativeSetter.set.call(editor, text);
+    } else {
+      editor.value = text;
+    }
+    // Dispatch input event for React
+    editor.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+    // Also dispatch a change event (some frameworks listen for this)
+    editor.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+  }
+
+  async function sendMessage(text) {
     const editor = getEditor();
     if (!editor) {
-      console.warn("[zs-mimo] editor not found");
+      diag("MiMo: editor not found");
       return false;
     }
-    const sendBtn = getSendBtn();
-    if (!sendBtn) {
-      console.warn("[zs-mimo] send button not found");
+    const btn = getSendButton();
+    if (!btn) {
+      diag("MiMo: send button not found");
       return false;
     }
 
-    // Focus and set value
-    editor.focus();
-    if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
-      // Native setter + input event for React-controlled inputs
-      const nativeSetter = Object.getOwnPropertyDescriptor(
-        HTMLTextAreaElement.prototype, 'value'
-      ) || Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype, 'value'
-      );
-      if (nativeSetter && nativeSetter.set) {
-        nativeSetter.set.call(editor, text);
-      } else {
-        editor.value = text;
-      }
-      editor.dispatchEvent(new Event('input', { bubbles: true }));
-    } else {
-      // contenteditable
-      editor.textContent = text;
-      editor.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-
-    // Wait a tick for React to process the input
+    // Type the text
+    typeIn(editor, text);
     await sleep(150);
 
-    // Attach images if any (for vision feedback)
-    if (images && images.length > 0) {
-      // Images are attached by the core via DOM manipulation
-      // For now, just log that we have images to attach
-      console.log("[zs-mimo] images to attach:", images.length);
-    }
-
-    // Click send
-    sendBtn.click();
+    // Click the send button
+    btn.click();
     return true;
   }
 
-  // Submit text directly (used for tool results)
-  async function submitText(text) {
-    return typeAndSend(text, null);
-  }
-
-  // Get the last assistant turn's text
-  function lastAssistantText() {
-    const items = assistantItems();
-    if (items.length === 0) return "";
-    return itemText(items[items.length - 1]);
-  }
-
-  // Get a snapshot of the current conversation state for diag
-  function snapshot() {
-    return {
-      userTurns: userCount(),
-      assistantTurns: assistantCount(),
-      generating: isGenerating(),
-    };
-  }
-
-  // Get the unique conversation key (URL-based)
-  function conversationKey() {
-    return window.location.pathname + window.location.search;
-  }
-
-  // Initialize - called by core/main.js
-  function init(opts) {
-    if (opts && opts.diag) diag = opts.diag;
-  }
-
-  // Wait for the response to complete
-  async function waitForResponse() {
-    // Wait until generation stops (idle for GEN_IDLE_MS)
-    let idleCount = 0;
-    while (idleCount < timings.GEN_IDLE_MS / 100) {
-      await sleep(100);
-      if (isGenerating()) {
-        idleCount = 0;
-      } else {
-        idleCount++;
-      }
-    }
-    // Small extra settle
-    await sleep(300);
-    return lastAssistantText();
-  }
-
-  // ── Public interface ────────────────────────────────────────────────────
+  // ── Public interface (required by core/main.js) ─────────────────────────
   return {
-    init,
-    timings,
-    snapshot,
-    conversationKey,
-    isGenerating,
-    stopGeneration,
-    typeAndSend,
-    submitText,
-    waitForResponse,
-    lastAssistantText,
+    init(diagFn) {
+      diag = diagFn || (() => {});
+      diag("MiMo provider initialised");
+    },
+
+    // Detect which MiMo variant we're on
+    siteName() {
+      if (location.hostname.includes('ultraspeed')) return "MiMo Ultra";
+      return "MiMo";
+    },
+
+    // Return the composer container so the core can position the bar
+    getComposer,
+
+    // Return the editor element
+    getEditor,
+
+    // Send a message through the MiMo UI
+    sendMessage,
+
+    // Type text into the editor without sending
+    typeIn,
+
+    // Turn classification
     allItems,
-    assistantItems,
-    userCount,
-    assistantCount,
     isUserItem,
     isAssistantItem,
     itemText,
     classifyText,
-    getEditor,
-    getSendBtn,
+    assistantItems,
+    assistantCount,
+    userCount,
+
+    // State
+    isGenerating,
+
+    // Error detection
+    getError() {
+      const surfaces = document.querySelectorAll(S.errorSurfaces);
+      for (const el of surfaces) {
+        if (el.closest('#zs-root')) continue;
+        const text = el.textContent.trim();
+        if (!text) continue;
+        if (RE.contextLimit.test(text)) return { kind: 'context', text };
+        if (RE.busy.test(text)) return { kind: 'busy', text };
+        if (RE.stopped.test(text)) return { kind: 'stopped', text };
+        if (RE.tooLong.test(text)) return { kind: 'toolong', text };
+      }
+      return null;
+    },
+
+    // Timings
+    timings,
+
+    // Regex patterns
+    RE,
   };
 })();
