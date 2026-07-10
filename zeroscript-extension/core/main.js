@@ -27,6 +27,32 @@
     return sleep(lo + Math.random() * (hi - lo));
   }
 
+  // ── State (MUST be declared before diag references it) ───────────────────
+  const A = {
+    running: false,
+    stop: false,
+    stopping: false,
+    userStopped: false,
+    lastGenAt: 0,
+    started: false,
+    starting: false,
+    startingKey: null,
+    startGen: 0,
+    loopKey: null,
+    bootBaselineId: null,
+    injecting: false,
+    toolRunning: false,
+    toolStart: 0,
+    toolName: "",
+    toolItem: null,
+    toolArg: "",
+    toolList: [],
+    toolNames: new Set(),
+    toolCallsSinceReminder: 0,
+    bridge: { connected: false, mcpAlive: false, tools: 0 },
+    pendingImages: null,
+  };
+
   // ── Diagnostics ───────────────────────────────────────────────────────────
   const ZS_DIAG_MAX = 300;
   const _diag = [];
@@ -57,8 +83,6 @@
     { robux: 1000, id: 1865192973 },
   ];
   const passUrl = (id) => `https://www.roblox.com/game-pass/${id}`;
-  // AI chat sites ZeroScript works on. Keep in sync with manifest.json
-  // content_scripts and background.js PROVIDER_URLS when adding a provider.
   const AI_SITES = [
     { name: "DeepSeek", url: "https://chat.deepseek.com/" },
     { name: "Gemini", url: "https://gemini.google.com/app" },
@@ -68,31 +92,6 @@
     { name: "Arena", url: "https://arena.ai/text/direct" },
     { name: "MiMo", url: "https://aistudio.xiaomimimo.com/" },
   ];
-
-  const A = {
-    running: false,
-    stop: false,
-    stopping: false,
-    userStopped: false,
-    lastGenAt: 0,
-    started: false,
-    starting: false,
-    startingKey: null,
-    startGen: 0,
-    loopKey: null,
-    bootBaselineId: null,
-    injecting: false,
-    toolRunning: false,
-    toolStart: 0,
-    toolName: "",
-    toolItem: null,
-    toolArg: "",
-    toolList: [],
-    toolNames: new Set(),
-    toolCallsSinceReminder: 0,
-    bridge: { connected: false, mcpAlive: false, tools: 0 },
-    pendingImages: null,
-  };
 
   // ── UI ────────────────────────────────────────────────────────────────────
   let root = null;
@@ -161,7 +160,6 @@
     startBtn.addEventListener("click", () => startSession());
     stopBtn.addEventListener("click", () => stopSession());
 
-    // Periodic status refresh
     setInterval(() => {
       chrome.runtime.sendMessage({ type: "status" }, (s) => {
         if (!s) return;
@@ -231,7 +229,6 @@
     updateButtons();
     showBanner("Starting session…", "info");
 
-    // Get tools from background
     const resp = await new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: "status" }, (s) => resolve(s));
     });
@@ -241,11 +238,9 @@
     }
     updateChips();
 
-    // Build and inject system prompt
     const siteName = P.name ? P.name() : "this AI site";
     const prompt = ZS.buildSystemPrompt({ siteName, tools: A.toolList });
     
-    // Type and send
     try {
       await P.typeAndSend(prompt);
       A.starting = false;
@@ -273,19 +268,13 @@
   async function agentLoop() {
     while (A.running && !A.stop) {
       try {
-        // Wait for generation to finish
         const reply = await P.waitForReply();
         if (!reply || A.stop) break;
         if (A.userStopped) { A.userStopped = false; break; }
 
-        // Parse command from reply
         const parsed = ZSParse.parse(reply);
-        if (!parsed || !parsed.tool) {
-          // No command found - plain text response, feed back to model
-          continue;
-        }
+        if (!parsed || !parsed.tool) continue;
 
-        // Execute tool
         A.toolName = parsed.tool;
         A.toolRunning = true;
         A.toolStart = Date.now();
@@ -296,7 +285,6 @@
         
         if (A.stop) break;
 
-        // Feed result back
         const feedback = formatToolResult(parsed.tool, result);
         await P.typeAndSend(feedback);
       } catch (e) {
